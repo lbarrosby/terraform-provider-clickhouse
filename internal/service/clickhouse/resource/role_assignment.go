@@ -3,8 +3,13 @@ package resource
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
+
+	"github.com/cenkalti/backoff/v4"
 
 	"github.com/ClickHouse/terraform-provider-clickhouse/internal/api"
 	"github.com/ClickHouse/terraform-provider-clickhouse/internal/service"
@@ -33,7 +38,20 @@ func NewRoleAssignmentResource() resource.Resource {
 
 type RoleAssignmentResource struct {
 	client api.Client
+
+	// actorsPollInterval and actorsMaxRetries bound how long Create and Update
+	// wait for the roles API to return the actors they just wrote. Zero values
+	// use the defaults below.
+	actorsPollInterval time.Duration
+	actorsMaxRetries   uint64
 }
+
+const (
+	defaultActorsPollInterval        = 2 * time.Second
+	defaultActorsMaxRetries   uint64 = 15
+)
+
+var errActorsNotPropagated = errors.New("role actors not yet propagated")
 
 type RoleAssignmentModel struct {
 	ID        types.String `tfsdk:"id"`
@@ -118,6 +136,11 @@ func (r *RoleAssignmentResource) Create(ctx context.Context, req resource.Create
 		return
 	}
 
+	if err := r.waitForActors(ctx, roleID, actors); err != nil {
+		resp.Diagnostics.AddError("Error reading role after create", "Could not read role actors: "+err.Error())
+		return
+	}
+
 	plan.ID = types.StringValue(roleID)
 	syncDiags, err := r.syncAssignmentState(ctx, &plan)
 	resp.Diagnostics.Append(syncDiags...)
@@ -147,6 +170,52 @@ func (r *RoleAssignmentResource) Read(ctx context.Context, req resource.ReadRequ
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, state)...)
+}
+
+// waitForActors polls the role until the API returns the actors that were just
+// written. The roles API is eventually consistent, so a read right after the
+// PATCH can still return the previous actors, which Terraform reports as an
+// inconsistent result and taints the resource. If the actors have not
+// propagated when the retries run out, it returns nil and lets the caller read
+// whatever the API returns, as before. API errors are returned.
+func (r *RoleAssignmentResource) waitForActors(ctx context.Context, roleID string, want []string) error {
+	interval := r.actorsPollInterval
+	if interval == 0 {
+		interval = defaultActorsPollInterval
+	}
+	maxRetries := r.actorsMaxRetries
+	if maxRetries == 0 {
+		maxRetries = defaultActorsMaxRetries
+	}
+
+	check := func() error {
+		role, err := r.client.GetRole(ctx, roleID)
+		if err != nil {
+			return backoff.Permanent(err)
+		}
+		if !sameActors(role.Actors, want) {
+			return errActorsNotPropagated
+		}
+		return nil
+	}
+
+	err := backoff.Retry(check, backoff.WithContext(backoff.WithMaxRetries(backoff.NewConstantBackOff(interval), maxRetries), ctx))
+	if errors.Is(err, errActorsNotPropagated) {
+		return nil
+	}
+	return err
+}
+
+// sameActors reports whether two actor lists hold the same actors, ignoring order.
+func sameActors(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	a := slices.Clone(got)
+	b := slices.Clone(want)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(a, b)
 }
 
 // syncAssignmentState fetches the role from the API and updates the assignment
@@ -203,6 +272,11 @@ func (r *RoleAssignmentResource) Update(ctx context.Context, req resource.Update
 	})
 	if err != nil {
 		resp.Diagnostics.AddError("Error updating role actors", "Could not update role actors: "+err.Error())
+		return
+	}
+
+	if err := r.waitForActors(ctx, state.RoleID.ValueString(), actors); err != nil {
+		resp.Diagnostics.AddError("Error reading role after update", "Could not read role actors: "+err.Error())
 		return
 	}
 
